@@ -14,16 +14,6 @@ def generate_simulation(x, f, edge_index, device,
                         input_dim=10, feature_dim=15, hidden_dim=16, output_dim=9, heads=2):
     model = GNN(input_dim, feature_dim, hidden_dim, output_dim, heads, device).to(device)
 
-    # Uncomment below to set the diagonal elements of the parameter matrices of the model to be 0.5 and 0 otherwise
-    # Probably not to uncomment to achieve better result
-#    state_dict = model.state_dict()
-#    param1 = 0.5*torch.eye(12)
-#    param2 = 0.5*torch.concat((torch.eye(7), torch.zeros((7,5))), dim=-1)
-#    state_dict['gat_cell.conv.lin_l.weight'].copy_(param1)
-#    state_dict['gat_cell.conv.lin_r.weight'].copy_(param1)
-#    state_dict['gat_cell.mlp.weight'].copy_(param2)
-#    model.load_state_dict(state_dict)
-
     x_norm = (x - torch.mean(x, dim=1, keepdim=True)) / torch.std(x, dim=1, keepdim=True)
     sim_theta = model(x_norm, edge_index)
     sim_error = torch.zeros((x.shape[0], x.shape[1]), device=device)
@@ -41,7 +31,7 @@ def generate_simulation(x, f, edge_index, device,
         torch.sum(torch.mul(sim_theta[:, :, 1:-3], torch.unsqueeze(f, dim=0)), dim=-1) + sim_error
     sim_theta = sim_theta.detach()
     sim_y = sim_y.detach()
-    return model, sim_theta, sim_y, sim_error
+    return model, sim_theta, sim_y, sim_error, sim_volatility
 
 
 def plot_theta(sim_theta, real_theta, stock):
@@ -99,11 +89,11 @@ def plot_theta(sim_theta, real_theta, stock):
 
 
     plt.tight_layout()
-    plt.savefig('plot/parameters_translastm/stock_' + str(stock) + '.png')
+    plt.savefig('plot/S=200_T=200_new/parameters/stock_' + str(stock) + '.png')
     plt.close()
 
 
-def plot_x_y(x, y, sim_e, e, stock):
+def plot_x_y(x, y, sim_e, e, sim_vol, stock):
     
     fig, axs = plt.subplots(3, 3, figsize=(20, 15))
 
@@ -123,13 +113,18 @@ def plot_x_y(x, y, sim_e, e, stock):
 
     # Plot simulated errors against fitted errors.
     axs[2, 0].plot(sim_e[stock, 1:], label='simulated error')
-    axs[2, 0].plot(e[stock, :], label='fitted error')
+    axs[2, 0].plot(y[stock, 1:] - sim_e[stock, 1:], label='simulated factors')
     axs[2, 0].legend()
-    axs[2, 1].scatter(range(e.shape[1]), e[stock, :] - sim_e[stock, 1:], s=5, label='residual')
+    axs[2, 1].plot(sim_e[stock, 1:], label='simulated error')
+    axs[2, 1].plot(e[stock, :], label='fitted error')
     axs[2, 1].legend()
+    # axs[2, 2].scatter(range(e.shape[1]), e[stock, :] - sim_e[stock, 1:], s=5, label='diffenrences')
+    # axs[2, 2].legend()
+    axs[2, 2].plot(np.sqrt(sim_vol[stock, 1:]), label='simulated volatility')
+    axs[2, 2].legend()
 
     plt.tight_layout()
-    plt.savefig('plot/x_and_y_translastm/stock_' + str(stock) + '.png')
+    plt.savefig('plot/S=200_T=200_new/x_and_y/stock_' + str(stock) + '.png')
     plt.close()
 
 
@@ -144,23 +139,19 @@ def plot_factor(f):
     axs[2].plot(f[:, 2], label='f_3')
     axs[2].legend()
     plt.tight_layout()
-    plt.savefig('plot/factor.png')
+    plt.savefig('plot/S=200_T=200_new/factor.png')
     plt.close()
 
 
 if __name__ == '__main__':
-    """
-    Things to do:
-    Upload the codes to github
-    """
     device = torch.device("cuda:0")
     torch.manual_seed(42)
     np.random.seed(42)
 
-    Stocks = 100
-    Times = 500
+    Stocks = 200
+    Times = 200
 
-    edge_index = sp.random(Stocks, Stocks, density=0.05, data_rvs=stats.binom(n=1, p=1).rvs)
+    edge_index = sp.random(Stocks, Stocks, density=0.5 - 1 / np.sqrt(5), data_rvs=stats.binom(n=1, p=1).rvs)
     edge_index = edge_index - np.transpose(edge_index)
     coo_edge_index = sp.coo_matrix(edge_index)
     edge_index = torch.tensor(np.array([coo_edge_index.row, coo_edge_index.col]), device=device, dtype=torch.long)
@@ -169,15 +160,22 @@ if __name__ == '__main__':
     graph = nx.Graph(graph)
     # Plot the graph
     pos = nx.spring_layout(graph)  # Layout algorithm for node positioning
-    nx.draw(graph, pos, with_labels=False, node_color='lightblue', node_size=200, edge_color='gray', width=1.0, alpha=0.7)
+    nx.draw(graph, pos, with_labels=False, node_color='lightblue', node_size=10, edge_color='gray', width=1.0, alpha=0.7)
     # Show the plot
-    plt.savefig('plot/graph.png')
+    plt.savefig('plot/S=200_T=200_new/graph.png')
     plt.close()
 
     x = torch.zeros((Stocks, Times, 5), device=device, dtype=torch.float)
     f = torch.zeros((Times, 3), device=device, dtype=torch.float)
+    Phit_f = torch.tensor(np.array([[0.4, 0.1, 0.0], 
+                                    [0.0, 0.1, 0.2], 
+                                    [0.1, 0.3, 0.3]]), device=device, dtype=torch.float)
+    Lt_f = torch.tensor(np.array([[0.5, 0.2, 0.1], 
+                                  [0.0, 0.3, 0.2], 
+                                  [0.0, 0.0, 0.4]]), device=device, dtype=torch.float)
+
     x_error = 0.5 * torch.randn((Stocks, Times, 5), device=device, dtype=torch.float)
-    f_error = 0.5 * torch.randn((Times, 3), device=device, dtype=torch.float)
+    f_error = torch.matmul(torch.randn((Times, 3), device=device, dtype=torch.float), Lt_f)
     x_0_mean = torch.randn((Stocks, 5), device=device, dtype=torch.float)
     f_0_mean = torch.randn(3, device=device, dtype=torch.float) + \
         torch.tensor(np.array([0, 0, 0]), device=device, dtype=torch.float)
@@ -187,28 +185,29 @@ if __name__ == '__main__':
             f[t, :] = f_0_mean + f_error[t, :]
         else:
             x[:, t, :] = x_0_mean + 0.866 * (x[:, t - 1, :] - x_0_mean) + x_error[:, t, :]
-            f[t, :] = f_0_mean + 0.866 * (f[t - 1, :] - f_0_mean) + f_error[t, :]
+            f[t, :] = f_0_mean + torch.matmul((f[t - 1, :] - f_0_mean), Phit_f) + f_error[t, :]
     x = x.detach()
     f = f.detach()
 
-    model_0, sim_theta, sim_y, sim_error = generate_simulation(x, f, edge_index, device, 
-                                                    input_dim=5, feature_dim=8, hidden_dim=12, output_dim=7, heads=1)
+    model_0, sim_theta, sim_y, sim_error, sim_vol = generate_simulation(x, f, edge_index, device, 
+                                                    input_dim=5, hidden_dim=12, output_dim=7, heads=4)
     
     x_np = x.cpu().numpy()
     y_np = sim_y.cpu().numpy()
     sim_e_np = sim_error.detach().cpu().numpy()
+    sim_vol_np = sim_vol.detach().cpu().numpy()
     
     f_np = f.cpu().numpy()
     plot_factor(f_np)
 
    
     loss_fn = LossFunction().to(device)
-    loss, __, __ = loss_fn(sim_y, f, sim_theta)
+    loss, __, __ = loss_fn(sim_y, f, sim_theta, 0)
     print(f"Original Loss: {loss.item()}\n")
 
-    model, theta, e, s2 = training(x, sim_y, f, edge_index, model_name='checkpoints/simulation_translstm.pth',
-                        device=device, input_dim=5, feature_dim=8, hidden_dim=12, output_dim=7, heads=1, 
-                        learning_rate=1e-2, num_epochs=400, sche=False)
+    model, theta, e, s2 = training(x, sim_y, f, edge_index, model_name='checkpoints/simulation_S=200_T=200_new.pth',
+                        device=device, input_dim=5, hidden_dim=12, output_dim=7, heads=4, 
+                        learning_rate=1e-2,  weight_decay=0.01, num_epochs=100, sche=False)
 
     theta_np = theta.cpu().detach().numpy()
     sim_theta_np = sim_theta.cpu().detach().numpy()
@@ -217,4 +216,4 @@ if __name__ == '__main__':
 
     for stock in range(3):
         plot_theta(sim_theta_np, theta_np, stock)
-        plot_x_y(x_np, y_np, sim_e_np, e_np, stock)
+        plot_x_y(x_np, y_np, sim_e_np, e_np, sim_vol_np, stock)

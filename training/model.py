@@ -1,10 +1,8 @@
 import copy
-import matplotlib.pyplot as plt
 import torch
 import numpy as np
 from torch import nn
-from torch_geometric.nn import TransformerConv, SAGEConv
-from arch.univariate import arch_model
+from torch_geometric.nn import TransformerConv
 
 from load_data import load_EOD_data
 
@@ -15,11 +13,8 @@ class GATCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, heads):
         super().__init__()
         self.conv = TransformerConv(in_channels=input_dim, out_channels=hidden_dim, heads=heads, concat=False)
-        #self.conv = SAGEConv(in_channels=input_dim, out_channels=hidden_dim, bias=False)
         self.mlp = nn.Linear(in_features=hidden_dim, out_features=output_dim, bias=False)
         self.tanh = nn.Tanh()
-        self.sigmoid = nn.Sigmoid()
-        self.softplus = nn.Softplus()
 
     def forward(self, x, theta, edge_index):
         x_in = torch.concat((x, theta), dim=-1)
@@ -33,18 +28,16 @@ class GNN(nn.Module):
     # x is a S*T*N tensor
     # x[t] refers to x_t, y[t] refers to y_{t+1}, theta[t] refers to \theta_{t+1}.
     # output is the factor model parameters and the Garch model parameters
-    def __init__(self, input_dim, feature_dim, hidden_dim, output_dim, heads, device):
+    def __init__(self, input_dim, hidden_dim, output_dim, heads, device):
         super().__init__()
         self.output_dim = output_dim
-        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=feature_dim, batch_first=True)
-        self.gat_cell = GATCell(feature_dim + output_dim, hidden_dim, output_dim, heads)
-        #self.gat_cell = GATCell(input_dim + output_dim, hidden_dim, output_dim, heads)
+        self.gat_cell = GATCell(input_dim + output_dim, hidden_dim, output_dim, heads)
         self.device = device
         self.sigmoid = nn.Sigmoid()
         self.softplus = nn.Softplus()
 
     def forward(self, x, edge_index, theta_t=None):
-        embedding, _ = self.lstm(x)
+        # embedding, _ = self.lstm(x)
         num_stock = x.size(dim=0)
         num_time = x.size(dim=1)
         theta_list = []
@@ -53,17 +46,17 @@ class GNN(nn.Module):
         if theta_t is None:
             theta_t = torch.zeros((num_stock, self.output_dim), requires_grad=True).to(self.device)
         for t in range(num_time):
-            theta_t = self.gat_cell(embedding[:, t, :], theta_t, edge_index)
-            #theta_t = self.gat_cell(x[:, t, :], theta_t, edge_index)
+            # theta_t = self.gat_cell(embedding[:, t, :], theta_t, edge_index)
+            theta_t = self.gat_cell(x[:, t, :], theta_t, edge_index)
             theta_list.append(theta_t)
         theta = torch.stack(theta_list, dim=1)
 
         # transform to get the Garch parameters
         alpha_beta = theta[:, :, 0:-3]
-        a_b = self.sigmoid(theta[:, :, -3:-1])
+        a_b = self.sigmoid(theta[:, :, -3:-1] + 2)
         a = torch.mul(a_b[:, :, 0:1], a_b[:, :, 1:])
         b = a_b[:, :, 0:1] - a
-        c = self.softplus(theta[:, :, -1:])
+        c = self.softplus(theta[:, :, -1:] - 1)
         output = torch.concat((alpha_beta, a, b, c), dim=-1)
         return output
 
@@ -72,13 +65,15 @@ class LossFunction(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, y, f, theta):
+    def forward(self, y, f, theta, w):
         num_time = y.size(dim=1)
+        a_plus_b = theta[:, :, -3] + theta[:, :, -2]
         epsilon = []
         sigma2 = []
         for t in range(num_time):
             if t == 0:
-                sigma2.append(theta[:, 0, -1])
+                sigma2.append(theta[:, 0, -1] + \
+                              torch.mul(a_plus_b[:, t], torch.mean(theta[:, :, -1], dim=1) / (1.0 - torch.mean(a_plus_b, dim=1))))
             else:
                 sigma2.append(theta[:, t, -1] + \
                               torch.mul(theta[:, t, -3], sigma2[-1]) + \
@@ -90,17 +85,18 @@ class LossFunction(nn.Module):
         epsilon = torch.stack(epsilon, dim=1)
         epsilon2 = torch.square(epsilon)
         sigma2 = torch.stack(sigma2, dim=1)
-        loss = torch.mean(epsilon2/sigma2 + torch.log(sigma2))
+        penalty = torch.mean(torch.square(theta[:, 1: , -3:] - theta[:, : -1, -3:]))
+        loss = torch.mean(epsilon2/sigma2 + torch.log(sigma2)) + w * penalty
         return loss, epsilon, sigma2
 
 
 def training(x, y, f, edge_index, model_name, 
              device, input_dim, feature_dim, hidden_dim, output_dim, heads, 
-             learning_rate, num_epochs, sche=False, milestones=None, gamma=None):
+             learning_rate, weight_decay, num_epochs, sche=False, milestones=None, gamma=None):
 
     model = GNN(input_dim, feature_dim, hidden_dim, output_dim, heads, device).to(device)
     loss_fn = LossFunction().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     if sche:
         scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
     x_norm = (x - torch.mean(x, dim=1, keepdim=True)) / torch.std(x, dim=1, keepdim=True)
@@ -109,7 +105,7 @@ def training(x, y, f, edge_index, model_name,
     for epoch in range(num_epochs):
         model.train()
         theta = model(x_norm, edge_index)
-        loss, e, s2 = loss_fn(y, f, theta)
+        loss, e, s2 = loss_fn(y, f, theta, w=0)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
